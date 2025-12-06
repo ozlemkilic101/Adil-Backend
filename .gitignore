@@ -179,3 +179,17 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
+# Ortam değişkenleri (çok önemli)
+.env
+*.env
+.env/
+
+# Sanal ortam klasörleri
+venv/
+.envs/
+
+# IDE klasörleri
+.idea/
+.vscode/
