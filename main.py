@@ -1,34 +1,46 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from groq import Groq
 import os
 import time
 import random
-import requests
 
 load_dotenv()
 
 app = FastAPI()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent"
+# ---------------------------
+# ENV
+# ---------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL_CHAT = os.getenv("GROQ_MODEL_CHAT", "llama-3.1-8b-instant")
+GROQ_MODEL_PETITION = os.getenv("GROQ_MODEL_PETITION", "llama-3.1-70b-versatile")  # dilekçe için daha iyi
 
-# --- Models ---
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY missing. Render Env Vars'a eklemelisin.")
+
+client = Groq(api_key=GROQ_API_KEY)
+
+# ---------------------------
+# Schemas
+# ---------------------------
 class ChatMessage(BaseModel):
-    role: str
+    role: str  # "user" veya "assistant"
     content: str
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
 
 class PetitionRequest(BaseModel):
-    prompt: str
+    prompt: str  # Android buildPrompt() çıktısı
 
 class ChatResponse(BaseModel):
     reply: str
 
-
+# ---------------------------
+# Prompts
+# ---------------------------
 SYSTEM_PROMPT_CHAT = """
 Sen 'Adil' isimli bir hukuk bilgi asistanısın.
 
@@ -45,175 +57,131 @@ Sen Türk mahkemelerine sunulacak RESMİ DİLEKÇE üreten bir asistansın.
 KESİNLİKLE UYULACAK KURALLAR:
 - SADECE düz metin yaz.
 - Markdown, *, -, • gibi işaretler KULLANMA.
-- Liste, madde işareti, otomatik numaralandırma YAPMA. (Kullanıcının şablonundaki 1) 2) 3) hariç)
-- Metnin sonuna açıklama, uyarı, bilgilendirme EKLEME.
-- "Avukata danışınız" vb. ifadeler YAZMA.
-- Kullanıcının verdiği şablonu ve sırayı BOZMA.
+- Şablonun başlık sırasını ve boş satırlarını BOZMA.
 - Şablon dışına tek cümle ekleme.
+- Metnin sonuna açıklama/uyarı/bilgilendirme ekleme.
 """.strip()
 
+# ---------------------------
+# Helpers
+# ---------------------------
+def _backoff_sleep(attempt: int):
+    # exponential backoff + jitter (timeout / geçici hata için)
+    base = min(20.0, (1.6 ** attempt))
+    time.sleep(1.5 + base + random.uniform(0.0, 0.8))
 
-# --- HTTP session (keep-alive) ---
-_session = requests.Session()
-_session.headers.update({"Content-Type": "application/json"})
-
-# timeouts (connect, read)
-# dilekçe üretimi uzun sürebilir -> read'i büyüt
-DEFAULT_TIMEOUT = (10, 140)
-
-
-def _post_with_retries(url: str, payload: dict, timeout=DEFAULT_TIMEOUT, max_retries: int = 5) -> requests.Response:
+def call_groq(messages: list[dict], *, model: str, max_tokens: int, temperature: float, retries: int = 3) -> str:
     """
-    Gemini'ye sağlam istek:
-    - 429 / 5xx / timeout / connection reset durumlarında retry
-    - exponential backoff + jitter
+    Groq çağrısı + retry.
+    - Groq SDK ağ hatalarında exception fırlatabilir; retry ile sağlamlaştırıyoruz.
     """
-    last_exc: Exception | None = None
-
-    for attempt in range(max_retries + 1):
+    last_err = None
+    for attempt in range(retries + 1):
         try:
-            r = _session.post(url, json=payload, timeout=timeout)
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            text = (completion.choices[0].message.content or "").strip()
+            if not text:
+                raise RuntimeError("Empty reply from Groq")
+            return text
+        except Exception as e:
+            last_err = e
+            if attempt == retries:
+                break
+            _backoff_sleep(attempt)
+    raise HTTPException(status_code=504, detail=f"Groq request failed: {str(last_err)}")
 
-            # 200 OK
-            if r.status_code == 200:
-                return r
+def normalize_petition_text(raw: str) -> str:
+    """
+    Dilekçede istemediğin markdown/disclaimer vb. çıkarsa temizler.
+    (Groq genelde uyuyor ama garanti olsun)
+    """
+    s = raw.strip()
+    # basit markdown temizleme
+    s = s.replace("**", "").replace("__", "").replace("`", "")
 
-            # Rate limit / server issues -> retry
-            if r.status_code in (408, 429, 500, 502, 503, 504):
-                # Retry-After varsa ona uyalım
-                retry_after = r.headers.get("Retry-After")
-                if retry_after:
-                    sleep_s = float(retry_after)
-                else:
-                    # exponential backoff + jitter
-                    base = 1.5 ** attempt
-                    sleep_s = min(30.0, 2.0 * base) + random.uniform(0.0, 0.8)
+    # Sonda ekstra bilgilendirme satırlarını kırp
+    cut_keywords = [
+        "genel bilgilendirme",
+        "avukata danış",
+        "bilgilendirme amaçlıdır",
+        "somut olay",
+        "danışmanız önerilir"
+    ]
+    lines = []
+    for line in s.splitlines():
+        t = line.strip().lower()
+        if any(k in t for k in cut_keywords):
+            break
+        lines.append(line)
+    s = "\n".join(lines).strip()
 
-                if attempt < max_retries:
-                    time.sleep(sleep_s)
-                    continue
+    # çok fazla boşluk
+    while "\n\n\n" in s:
+        s = s.replace("\n\n\n", "\n\n")
 
-            # diğer HTTP hataları: retry yapmadan dön
-            return r
+    return s
 
-        except requests.Timeout as e:
-            last_exc = e
-            if attempt < max_retries:
-                sleep_s = min(35.0, 2.5 * (1.6 ** attempt)) + random.uniform(0.0, 1.2)
-                time.sleep(sleep_s)
-                continue
-            raise
-
-        except requests.RequestException as e:
-            last_exc = e
-            if attempt < max_retries:
-                sleep_s = min(35.0, 2.5 * (1.6 ** attempt)) + random.uniform(0.0, 1.2)
-                time.sleep(sleep_s)
-                continue
-            raise
-
-    # normalde buraya düşmez ama garanti
-    raise last_exc or RuntimeError("Gemini request failed")
-
-
-def call_gemini(
-    text: str,
-    system_instruction: str | None = None,
-    *,
-    max_output_tokens: int = 900,
-    temperature: float = 0.3,
-    timeout=DEFAULT_TIMEOUT
-) -> str:
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing (env var)")
-
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": text}]}
-        ],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_output_tokens
-        }
-    }
-
-    if system_instruction:
-        payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-
-    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
-
-    try:
-        r = _post_with_retries(url, payload, timeout=timeout, max_retries=5)
-    except requests.Timeout:
-        # Render tarafında kullanıcıya daha açıklayıcı dönelim
-        raise HTTPException(
-            status_code=504,
-            detail="Gemini timeout: yanıt süresi aşıldı. (Uzun metinlerde olabilir; tekrar deneyin.)"
-        )
-    except requests.RequestException as e:
-        raise HTTPException(status_code=504, detail=f"Gemini request failed: {str(e)}")
-
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Gemini HTTP {r.status_code}: {r.text}")
-
-    try:
-        data = r.json()
-        cand = (data.get("candidates") or [{}])[0]
-        finish = cand.get("finishReason", "UNKNOWN")
-        out = (
-            ((cand.get("content") or {}).get("parts") or [{}])[0]
-            .get("text", "")
-        ).strip()
-
-        if not out:
-            raise HTTPException(status_code=502, detail=f"Gemini empty output. finishReason={finish}. Raw={data}")
-
-        # Eğer token yüzünden kesildiyse bunu da bildir (debug için)
-        # (İstersen bunu response'a ekleyebiliriz; şimdilik log gibi kalsın)
-        # print("Gemini finishReason:", finish, "len:", len(out))
-
-        return out
-
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=500, detail=f"Parse error. Raw JSON: {r.text}")
-
-
+# ---------------------------
+# Routes
+# ---------------------------
 @app.get("/")
 def root():
-    return {"message": "Adil backend çalışıyor 🚀", "provider": "gemini", "model": GEMINI_MODEL}
-
+    return {
+        "message": "Adil backend çalışıyor 🚀",
+        "provider": "groq",
+        "chat_model": GROQ_MODEL_CHAT,
+        "petition_model": GROQ_MODEL_PETITION,
+    }
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    convo_lines = [f"SİSTEM:\n{SYSTEM_PROMPT_CHAT}\n"]
+    """
+    Genel hukuk chatbot endpoint'i.
+    Android buraya messages listesini gönderir.
+    """
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT_CHAT}]
     for m in req.messages:
         role = (m.role or "").strip().lower()
         if role not in ("user", "assistant"):
             role = "user"
-        tag = "KULLANICI" if role == "user" else "ASİSTAN"
-        convo_lines.append(f"{tag}: {m.content}")
+        msgs.append({"role": role, "content": (m.content or "").strip()})
 
-    final_text = "\n\n".join(convo_lines).strip()
-
-    # chat genelde kısa -> 900 token yeter
-    reply = call_gemini(final_text, max_output_tokens=900, temperature=0.3)
+    reply = call_groq(
+        msgs,
+        model=GROQ_MODEL_CHAT,
+        max_tokens=900,        # chat için yeterli
+        temperature=0.3,
+        retries=3
+    )
     return ChatResponse(reply=reply)
-
 
 @app.post("/api/petitions", response_model=ChatResponse)
 def generate_petition(req: PetitionRequest):
+    """
+    Android DilekceViewModel -> buildPrompt() çıktısını DOĞRUDAN buraya gönderir.
+    """
     prompt = (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is empty")
 
-    # dilekçe uzun -> token ve read timeout artır
-    reply = call_gemini(
-        text=prompt,
-        system_instruction=SYSTEM_PROMPT_PETITION,
-        max_output_tokens=3000,
+    msgs = [
+        {"role": "system", "content": SYSTEM_PROMPT_PETITION},
+        {"role": "user", "content": prompt}
+    ]
+
+    # dilekçe uzun: token'ı yükselt
+    reply = call_groq(
+        msgs,
+        model=GROQ_MODEL_PETITION,
+        max_tokens=2500,       # A4 çıktıya yakın uzunluk
         temperature=0.2,
-        timeout=(10, 180)  # uzun metin için daha güvenli
+        retries=3
     )
+
+    reply = normalize_petition_text(reply)
     return ChatResponse(reply=reply)
