@@ -5,6 +5,7 @@ from groq import Groq
 import os
 import time
 import random
+from enum import Enum  # ✅ EKLENDİ
 
 load_dotenv()
 
@@ -32,8 +33,21 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
 
+# ✅ ADIM 1: Dilekçe tipi enum (Android buraya enum name gönderecek)
+class DilekceType(str, Enum):
+    ALACAK_DAVASI = "ALACAK_DAVASI"
+    CEVAP_DILEKCESI = "CEVAP_DILEKCESI"
+    ITIRAZ_DILEKCESI = "ITIRAZ_DILEKCESI"
+    ICRA_ITIRAZ = "ICRA_ITIRAZ"
+    SIKAYET = "SIKAYET"
+    TAZMINAT = "TAZMINAT"
+    DIGER = "DIGER"
+
+# ✅ PetitionRequest artık dilekçe tipini de alıyor
 class PetitionRequest(BaseModel):
+    dilekce_tipi: DilekceType
     prompt: str  # Android buildPrompt() çıktısı
+    diger_aciklama: str | None = None  # dilekce_tipi == DIGER ise zorunlu yapacağız
 
 class ChatResponse(BaseModel):
     reply: str
@@ -126,6 +140,20 @@ def normalize_petition_text(raw: str) -> str:
 
     return s
 
+def build_petition_user_prompt(req: PetitionRequest) -> str:
+    """
+    ✅ ADIM 1: Dilekçe tipini prompt'a üstten enjekte ediyoruz.
+    Android buildPrompt() metni aynen korunur.
+    """
+    tip_line = f"SEÇİLEN DİLEKÇE TÜRÜ: {req.dilekce_tipi.value}"
+
+    extra = ""
+    if req.dilekce_tipi == DilekceType.DIGER:
+        # DIGER ise açıklama zorunlu (route içinde kontrol edeceğiz)
+        extra = f"\nDİĞER AÇIKLAMA: {req.diger_aciklama.strip()}"
+
+    return f"{tip_line}{extra}\n\n{req.prompt.strip()}"
+
 # ---------------------------
 # Routes
 # ---------------------------
@@ -164,14 +192,22 @@ def chat(req: ChatRequest):
 def generate_petition(req: PetitionRequest):
     """
     Android DilekceViewModel -> buildPrompt() çıktısını DOĞRUDAN buraya gönderir.
+    ✅ Artık dilekce_tipi zorunlu.
     """
     prompt = (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is empty")
 
+    # ✅ DIGER seçildiyse açıklama zorunlu
+    if req.dilekce_tipi == DilekceType.DIGER:
+        if not req.diger_aciklama or not req.diger_aciklama.strip():
+            raise HTTPException(status_code=400, detail="diger_aciklama is required when dilekce_tipi is DIGER")
+
+    user_prompt = build_petition_user_prompt(req)
+
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT_PETITION},
-        {"role": "user", "content": prompt}
+        {"role": "user", "content": user_prompt}
     ]
 
     # dilekçe uzun: token'ı yükselt
