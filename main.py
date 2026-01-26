@@ -5,7 +5,7 @@ from groq import Groq
 import os
 import time
 import random
-from enum import Enum  # ✅ EKLENDİ
+from enum import Enum
 
 load_dotenv()
 
@@ -16,7 +16,12 @@ app = FastAPI()
 # ---------------------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL_CHAT = os.getenv("GROQ_MODEL_CHAT", "llama-3.1-8b-instant")
-GROQ_MODEL_PETITION = os.getenv("GROQ_MODEL_PETITION", "llama-3.1-70b-versatile")  # dilekçe için daha iyi
+GROQ_MODEL_PETITION = os.getenv("GROQ_MODEL_PETITION", "llama-3.1-70b-versatile")
+
+# Dilekçe üretimi için güvenli limitler (Render timeout yememek için)
+PETITION_DRAFT_MAX_TOKENS = int(os.getenv("PETITION_DRAFT_MAX_TOKENS", "900"))
+PETITION_IMPROVE_MAX_TOKENS = int(os.getenv("PETITION_IMPROVE_MAX_TOKENS", "650"))
+PETITION_MIN_CHARS_FOR_SKIP_IMPROVE = int(os.getenv("PETITION_MIN_CHARS_FOR_SKIP_IMPROVE", "1400"))
 
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY missing. Render Env Vars'a eklemelisin.")
@@ -27,13 +32,12 @@ client = Groq(api_key=GROQ_API_KEY)
 # Schemas
 # ---------------------------
 class ChatMessage(BaseModel):
-    role: str  # "user" veya "assistant"
+    role: str
     content: str
 
 class ChatRequest(BaseModel):
     messages: list[ChatMessage]
 
-# ✅ ADIM 1: Dilekçe tipi enum (Android buraya enum name gönderecek)
 class DilekceType(str, Enum):
     ALACAK_DAVASI = "ALACAK_DAVASI"
     CEVAP_DILEKCESI = "CEVAP_DILEKCESI"
@@ -43,11 +47,10 @@ class DilekceType(str, Enum):
     TAZMINAT = "TAZMINAT"
     DIGER = "DIGER"
 
-# ✅ PetitionRequest artık dilekçe tipini de alıyor
 class PetitionRequest(BaseModel):
     dilekce_tipi: DilekceType
-    prompt: str  # Android buildPrompt() çıktısı
-    diger_aciklama: str | None = None  # dilekce_tipi == DIGER ise zorunlu yapacağız
+    prompt: str
+    diger_aciklama: str | None = None
 
 class ChatResponse(BaseModel):
     reply: str
@@ -80,14 +83,13 @@ KESİNLİKLE UYULACAK KURALLAR:
 # Helpers
 # ---------------------------
 def _backoff_sleep(attempt: int):
-    # exponential backoff + jitter (timeout / geçici hata için)
-    base = min(20.0, (1.6 ** attempt))
-    time.sleep(1.5 + base + random.uniform(0.0, 0.8))
+    base = min(6.0, (1.6 ** attempt))
+    time.sleep(0.8 + base + random.uniform(0.0, 0.6))
 
-def call_groq(messages: list[dict], *, model: str, max_tokens: int, temperature: float, retries: int = 3) -> str:
+def call_groq(messages: list[dict], *, model: str, max_tokens: int, temperature: float, retries: int = 1) -> str:
     """
     Groq çağrısı + retry.
-    - Groq SDK ağ hatalarında exception fırlatabilir; retry ile sağlamlaştırıyoruz.
+    Render timeout riskini azaltmak için retries varsayılanı 1'e çekildi.
     """
     last_err = None
     for attempt in range(retries + 1):
@@ -107,18 +109,13 @@ def call_groq(messages: list[dict], *, model: str, max_tokens: int, temperature:
             if attempt == retries:
                 break
             _backoff_sleep(attempt)
+
     raise HTTPException(status_code=504, detail=f"Groq request failed: {str(last_err)}")
 
 def normalize_petition_text(raw: str) -> str:
-    """
-    Dilekçede istemediğin markdown/disclaimer vb. çıkarsa temizler.
-    (Groq genelde uyuyor ama garanti olsun)
-    """
     s = raw.strip()
-    # basit markdown temizleme
     s = s.replace("**", "").replace("__", "").replace("`", "")
 
-    # Sonda ekstra bilgilendirme satırlarını kırp
     cut_keywords = [
         "genel bilgilendirme",
         "avukata danış",
@@ -134,25 +131,27 @@ def normalize_petition_text(raw: str) -> str:
         lines.append(line)
     s = "\n".join(lines).strip()
 
-    # çok fazla boşluk
     while "\n\n\n" in s:
         s = s.replace("\n\n\n", "\n\n")
 
     return s
 
 def build_petition_user_prompt(req: PetitionRequest) -> str:
-    """
-    ✅ ADIM 1: Dilekçe tipini prompt'a üstten enjekte ediyoruz.
-    Android buildPrompt() metni aynen korunur.
-    """
     tip_line = f"SEÇİLEN DİLEKÇE TÜRÜ: {req.dilekce_tipi.value}"
 
     extra = ""
     if req.dilekce_tipi == DilekceType.DIGER:
-        # DIGER ise açıklama zorunlu (route içinde kontrol edeceğiz)
         extra = f"\nDİĞER AÇIKLAMA: {req.diger_aciklama.strip()}"
 
     return f"{tip_line}{extra}\n\n{req.prompt.strip()}"
+
+def build_improve_prompt(draft_text: str) -> str:
+    # İkinci çağrı: sadece mevcut dilekçeyi aynı formatla biraz daha detaylandır
+    return (
+        "Aşağıdaki dilekçeyi şablon sırasını ve resmi dili koruyarak biraz daha detaylandır. "
+        "Yeni başlık ekleme, markdown kullanma, en sona uyarı ekleme.\n\n"
+        f"{draft_text}"
+    )
 
 # ---------------------------
 # Routes
@@ -164,14 +163,12 @@ def root():
         "provider": "groq",
         "chat_model": GROQ_MODEL_CHAT,
         "petition_model": GROQ_MODEL_PETITION,
+        "petition_draft_max_tokens": PETITION_DRAFT_MAX_TOKENS,
+        "petition_improve_max_tokens": PETITION_IMPROVE_MAX_TOKENS,
     }
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
-    """
-    Genel hukuk chatbot endpoint'i.
-    Android buraya messages listesini gönderir.
-    """
     msgs = [{"role": "system", "content": SYSTEM_PROMPT_CHAT}]
     for m in req.messages:
         role = (m.role or "").strip().lower()
@@ -182,42 +179,54 @@ def chat(req: ChatRequest):
     reply = call_groq(
         msgs,
         model=GROQ_MODEL_CHAT,
-        max_tokens=900,        # chat için yeterli
+        max_tokens=900,
         temperature=0.3,
-        retries=3
+        retries=2
     )
     return ChatResponse(reply=reply)
 
 @app.post("/api/petitions", response_model=ChatResponse)
 def generate_petition(req: PetitionRequest):
-    """
-    Android DilekceViewModel -> buildPrompt() çıktısını DOĞRUDAN buraya gönderir.
-    ✅ Artık dilekce_tipi zorunlu.
-    """
     prompt = (req.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is empty")
 
-    # ✅ DIGER seçildiyse açıklama zorunlu
     if req.dilekce_tipi == DilekceType.DIGER:
         if not req.diger_aciklama or not req.diger_aciklama.strip():
             raise HTTPException(status_code=400, detail="diger_aciklama is required when dilekce_tipi is DIGER")
 
     user_prompt = build_petition_user_prompt(req)
 
-    msgs = [
+    # 1) DRAFT: hızlı model ile (timeout yememek için)
+    draft_msgs = [
         {"role": "system", "content": SYSTEM_PROMPT_PETITION},
         {"role": "user", "content": user_prompt}
     ]
 
-    # dilekçe uzun: token'ı yükselt
-    reply = call_groq(
-        msgs,
-        model=GROQ_MODEL_PETITION,
-        max_tokens=2500,       # A4 çıktıya yakın uzunluk
+    draft = call_groq(
+        draft_msgs,
+        model=GROQ_MODEL_CHAT,                  # ✅ hızlı model
+        max_tokens=PETITION_DRAFT_MAX_TOKENS,
         temperature=0.2,
-        retries=3
+        retries=1
     )
+    draft = normalize_petition_text(draft)
 
-    reply = normalize_petition_text(reply)
-    return ChatResponse(reply=reply)
+    # 2) IMPROVE: sadece gerekiyorsa (kısa kaldıysa) 70B ile küçük revizyon
+    if len(draft) < PETITION_MIN_CHARS_FOR_SKIP_IMPROVE:
+        improve_msgs = [
+            {"role": "system", "content": SYSTEM_PROMPT_PETITION},
+            {"role": "user", "content": build_improve_prompt(draft)}
+        ]
+        improved = call_groq(
+            improve_msgs,
+            model=GROQ_MODEL_PETITION,          # ✅ kalite için
+            max_tokens=PETITION_IMPROVE_MAX_TOKENS,
+            temperature=0.2,
+            retries=1
+        )
+        improved = normalize_petition_text(improved)
+        if len(improved) > len(draft):
+            draft = improved
+
+    return ChatResponse(reply=draft)
